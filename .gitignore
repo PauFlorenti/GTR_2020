@@ -1,0 +1,46 @@
+# Prerequisites
+*.d
+
+# Compiled Object files
+*.slo
+*.lo
+*.o
+*.obj
+
+# Precompiled Headers
+*.gch
+*.pch
+
+# Compiled Dynamic libraries
+*.so
+*.dylib
+*.dll
+
+# Fortran module files
+*.mod
+*.smod
+
+# Compiled Static libraries
+*.lai
+*.la
+*.a
+*.lib
+
+# Executables
+*.exe
+*.out
+*.app
+
+# Own Files
+framework*
+LICENSE
+data/asphalt.png
+data/panorama.hdre
+data/urgull_umusacsual.png
+data/meshes/
+data/prefabs/
+data/textures/
+irradiance.bin
+imgui.ini
+visualstudio/
+xcode/

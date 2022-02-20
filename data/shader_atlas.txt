@@ -1,0 +1,1447 @@
+//example of some shaders compiled
+flat basic.vs flat.fs
+texture basic.vs texture.fs
+depth quad.vs depth.fs
+multi basic.vs multi.fs
+light basic.vs light.fs
+deform quad.vs deform.fs
+deferred basic.vs deferred.fs
+deferred_pospo quad.vs deferred_pospo.fs
+ssao quad.vs ssao.fs
+blur quad.vs blur.fs
+probe basic.vs probe.fs
+reflection quad.vs reflection.fs
+skybox basic.vs skybox.fs
+volumetric quad.vs volumetric.fs
+decal basic.vs decal.fs
+
+\basic.vs
+
+#version 330 core
+
+in vec3 a_vertex;
+in vec3 a_normal;
+in vec2 a_uv;
+in vec4 a_color;
+
+uniform vec3 u_camera_pos;
+
+uniform mat4 u_model;
+uniform mat4 u_viewprojection;
+
+//this will store the color for the pixel shader
+out vec3 v_position;
+out vec3 v_world_position;
+out vec3 v_normal;
+out vec2 v_uv;
+out vec4 v_color;
+
+void main()
+{	
+	//calcule the normal in camera space (the NormalMatrix is like ViewMatrix but without traslation)
+	v_normal = (u_model * vec4( a_normal, 0.0) ).xyz;
+	
+	//calcule the vertex in object space
+	v_position = a_vertex;
+	v_world_position = (u_model * vec4( v_position, 1.0)).xyz;
+	
+	//store the color in the varying var to use it from the pixel shader
+	v_color = a_color;
+
+	//store the texture coordinates
+	v_uv = a_uv;
+
+	//calcule the position of the vertex using the matrices
+	gl_Position = u_viewprojection * vec4( v_world_position, 1.0 );
+}
+
+\quad.vs
+
+#version 330 core
+
+in vec3 a_vertex;
+in vec2 a_uv;
+out vec2 v_uv;
+
+void main()
+{	
+	v_uv = a_uv;
+	gl_Position = vec4( a_vertex, 1.0 );
+}
+
+
+\flat.fs
+
+#version 330 core
+
+uniform vec4 u_color;
+
+out vec4 FragColor;
+
+void main()
+{
+	FragColor = u_color;
+}
+
+
+\texture.fs
+
+#version 330 core
+
+in vec3 v_position;
+in vec3 v_world_position;
+in vec3 v_normal;
+in vec2 v_uv;
+in vec4 v_color;
+
+uniform vec4 u_color;
+uniform sampler2D u_texture;
+uniform float u_time;
+uniform float u_alpha_cutoff;
+
+out vec4 FragColor;
+
+void main()
+{
+	vec2 uv = v_uv;
+	vec4 color = u_color;
+	color *= texture( u_texture, uv );
+
+	if(color.a < u_alpha_cutoff)
+		discard;
+
+	FragColor = color;
+}
+
+
+\light.fs
+
+#version 330 core
+
+in vec3 v_position;
+in vec3 v_world_position;
+in vec3 v_normal;
+in vec2 v_uv;
+in vec4 v_color;
+
+uniform vec4 u_color;
+uniform sampler2D u_texture;
+uniform float u_time;
+uniform float u_alpha_cutoff;
+uniform vec3 u_ambient_light;
+uniform vec3 u_light_position;
+uniform vec3 u_light_color;
+uniform vec3 u_light_direction;
+uniform float u_light_maxdist;
+uniform float u_light_intensity;
+uniform vec3 u_light_vector;	//light vector for directional light
+uniform int u_light_type;
+uniform float u_light_spot_cosine;
+uniform float u_light_spot_exponent;
+uniform vec3 u_emissive_factor;
+uniform sampler2DShadow u_emissive_texture;
+uniform float u_factor;
+uniform vec2 u_shadow_texture_size;
+
+uniform bool u_bool_shadow;
+uniform bool u_is_cascade;
+uniform sampler2D u_shadow_map;
+
+uniform mat4 u_shadow_viewprojection_array[4];	//for cascade in DIRECTIONAL
+uniform mat4 u_shadow_viewprojection;			//for PHONG only so far
+
+out vec4 FragColor;
+
+vec3 phong( in vec3 normal, in vec3 point_position )
+{
+	vec3 N = normalize(normal);
+	vec3 L = normalize( u_light_position - point_position );
+	float NdotL = dot(N, L);
+	NdotL = clamp(NdotL, 0.0, 1.0); 
+	return NdotL * u_light_color * u_light_intensity;
+}
+
+float getSpotFactor( in float cosine, in float exponent)
+{
+	return pow(cosine, exponent);
+}
+
+vec3 spotDirection( in float spot_cosine, in vec3 spot_direction, in vec3 light_position, in vec3 world_position, in vec3 normal, in vec3 light_color, in float spot_exponent, in float intensity )
+{
+	vec3 L = normalize( light_position - world_position );
+	float theta = dot( -L, normalize(spot_direction) );
+	if(theta >= spot_cosine)
+	{
+		vec3 final_color = phong( normal, v_world_position ) * getSpotFactor( spot_cosine, spot_exponent );
+		return final_color;
+	}	
+	return vec3(0.0);
+}
+
+float computeAttenuation( in vec3 light_position, in vec3 object_position, in float maxDist )
+{
+	float distance = length(object_position - light_position);
+	float att_factor = maxDist - distance;
+	att_factor /= maxDist;
+	att_factor = max(att_factor, 0.0);
+	return att_factor*att_factor;
+}
+
+bool checkShadowmapLevel( in int shadow_index, inout vec3 shadow_uv, inout vec4 shadow_proj_pos )
+{
+	shadow_proj_pos = u_shadow_viewprojection_array[shadow_index] * vec4(v_world_position, 1.0);
+	shadow_uv = shadow_proj_pos.xyz / shadow_proj_pos.w;
+
+	shadow_uv = shadow_uv * 0.5 + vec3(0.5);
+
+	if( shadow_proj_pos.x < 1 && shadow_proj_pos.x > -1 && shadow_proj_pos.y < 1 && shadow_proj_pos.y > -1 )
+		return true;
+	return false;
+}
+
+float computeShadowFactor( in int type )
+{
+
+	bool auxiliar;
+	int level = 0;
+	vec3 shadow_uv;
+	vec4 shadow_proj_pos;
+
+	if( type == 0 && u_is_cascade ) //DIRECTIONAL
+	{
+		for( int i = 0; i < 4; i++)
+		{
+			auxiliar = checkShadowmapLevel( i, shadow_uv, shadow_proj_pos );
+			if( auxiliar ){
+				level = i;
+				break;
+			}
+		}
+
+		if( !auxiliar )
+			return 0.0;
+
+		switch( level ){
+			case 0:	shadow_uv *= 0.5; break;
+			case 1: shadow_uv.x = shadow_uv.x * 0.5 + 0.5; 
+					shadow_uv.y = shadow_uv.y * 0.5; break;
+			case 2: shadow_uv.x = shadow_uv.x * 0.5;
+					shadow_uv.y = shadow_uv.y * 0.5 + 0.5; break;
+			case 3: shadow_uv = shadow_uv * 0.5 + 0.5; break;
+		}
+	}
+	else	//SPOT
+	{
+		shadow_proj_pos = u_shadow_viewprojection * vec4(v_world_position, 1.0);
+		shadow_uv = shadow_proj_pos.xyz / shadow_proj_pos.w;
+
+		shadow_uv = shadow_uv * 0.5 + vec3(0.5);
+	}
+
+	float real_depth = (shadow_proj_pos.z - 0.000105) / shadow_proj_pos.w;
+	real_depth = real_depth * 0.5 + 0.5;
+	
+	float shadow_depth = texture( u_shadow_map, shadow_uv.xy ).x;
+	if (shadow_depth < real_depth)
+		return 0.0;
+	return 1.0;
+
+}
+
+void main()
+{
+	vec3 light = vec3(0.0);
+	float dist = length(u_light_position - v_world_position);
+
+	vec2 uv = v_uv;
+	vec4 color = u_color;
+	vec4 emissive = vec4(u_emissive_factor, 1.0);
+	emissive *= texture( u_emissive_texture, vec3(uv, 1));
+
+	vec4 color_texture = texture( u_texture, uv);
+	color_texture = color_texture * color;
+
+	if(u_light_type == 0)	//in case the light is directional (constant vector)
+	{
+		light += phong(v_normal, vec3(0.0));
+		if( u_bool_shadow )
+			light *= computeShadowFactor(u_light_type);
+	}
+	else	//in case it is point light or spot light
+	{
+		if(u_light_type == 1)
+		{
+			light += phong( v_normal, v_world_position );
+		}
+		else if(u_light_type == 2)
+		{
+			light += spotDirection( u_light_spot_cosine, u_light_direction, u_light_position, v_world_position, v_normal, u_light_color, u_light_spot_exponent, u_light_intensity );
+			if( u_bool_shadow )
+				light *= computeShadowFactor(u_light_type);
+		}
+			
+		//compute attenuation
+		float att_factor = computeAttenuation( u_light_position, v_world_position, u_light_maxdist );
+
+		light *= att_factor;
+	}
+
+	light += u_ambient_light;	//add the ambient light since after the att_factor since it is not affected by that
+
+	if(color.a < u_alpha_cutoff)
+		discard;
+
+	color_texture.xyz *= light;
+	//emissive.xyz *= light;
+	
+	FragColor = color_texture; //+ emissive;
+}
+
+\multi.fs
+
+#version 330 core
+
+in vec3 v_position;
+in vec3 v_world_position;
+in vec3 v_normal;
+in vec2 v_uv;
+
+uniform vec4 u_color;
+uniform sampler2D u_texture;
+uniform float u_time;
+uniform float u_alpha_cutoff;
+
+layout(location = 0) out vec4 FragColor;
+layout(location = 1) out vec4 NormalColor;
+
+void main()
+{
+	vec2 uv = v_uv;
+	vec4 color = u_color;
+	color *= texture( u_texture, uv );
+
+	if(color.a < u_alpha_cutoff)
+		discard;
+
+	vec3 N = normalize(v_normal);
+
+	FragColor = color;
+	NormalColor = vec4(N,1.0);
+}
+
+
+\depth.fs
+
+#version 330 core
+
+uniform vec2 u_camera_nearfar;
+uniform sampler2D u_texture; //depth map
+in vec2 v_uv;
+out vec4 FragColor;
+
+void main()
+{
+	float n = u_camera_nearfar.x;
+	float f = u_camera_nearfar.y;
+	float z = texture2D(u_texture, v_uv).x;
+	float color = n * (z + 1.0) / (f + n - z * (f - n));
+	FragColor = vec4(color);
+}
+
+
+\instanced.vs
+
+#version 330 core
+
+in vec3 a_vertex;
+in vec3 a_normal;
+in vec2 a_uv;
+
+in mat4 u_model;
+
+uniform vec3 u_camera_pos;
+
+uniform mat4 u_viewprojection;
+
+//this will store the color for the pixel shader
+out vec3 v_position;
+out vec3 v_world_position;
+out vec3 v_normal;
+out vec2 v_uv;
+
+void main()
+{	
+	//calcule the normal in camera space (the NormalMatrix is like ViewMatrix but without traslation)
+	v_normal = (u_model * vec4( a_normal, 0.0) ).xyz;
+	
+	//calcule the vertex in object space
+	v_position = a_vertex;
+	v_world_position = (u_model * vec4( a_vertex, 1.0) ).xyz;
+	
+	//store the texture coordinates
+	v_uv = a_uv;
+
+	//calcule the position of the vertex using the matrices
+	gl_Position = u_viewprojection * vec4( v_world_position, 1.0 );
+}
+
+\deform.fs
+
+#version 330 core
+
+uniform float u_time;
+uniform vec2 u_uv;
+uniform sampler2D u_texture;
+uniform vec4 u_color;
+
+in vec2 v_uv;
+
+out vec4 FragColor;
+
+void main()
+{
+
+	vec2 uv = v_uv;
+	vec4 color = u_color;
+	uv.x += sin(u_time ) * 0.1;
+	color *= texture( u_texture, uv );
+	FragColor = color;
+};
+
+\deferred.fs
+
+#version 330 core
+
+uniform sampler2D u_color_texture;
+uniform sampler2D u_metal_roughness_texture;
+uniform float u_metallic_factor;
+uniform float u_roughness_factor;
+uniform vec4 u_color;
+
+in vec3 v_normal;
+in vec2 v_uv;
+in vec4 v_color;
+
+layout(location = 0) out vec4 FragColor;
+layout(location = 1) out vec3 FragNormal;
+layout(location = 2) out vec4 ExtraColor;
+
+vec3 degamma( vec3 c );
+vec3 gamma( vec3 c );
+
+void main()
+{
+	//computations
+	vec3 N = v_normal;
+	N = N * 0.5 + 0.5;
+
+	vec4 color = u_color;
+	vec4 texture = texture2D( u_color_texture, v_uv );
+	texture.xyz = degamma( texture.xyz );
+	color *= texture;
+
+	vec4 metal_roughness = texture2D( u_metal_roughness_texture, v_uv );
+	metal_roughness.z *= u_metallic_factor;
+	metal_roughness.y *= u_roughness_factor;
+
+	//roughness.xyz = degamma( roughness.xyz );
+
+	//return values
+	FragColor = color;
+	//FragColor = vec4(degamma( texture.xyz ),1);
+	FragNormal = N;
+	ExtraColor = metal_roughness;	//for specular maybe?
+}
+
+vec3 degamma(vec3 c)
+{
+	return pow(c,vec3(2.2));
+}
+
+vec3 gamma(vec3 c)
+{
+	return pow(c,vec3(1.0/2.2));
+}
+
+\deferred_pospo.fs
+
+#version 330 core
+
+precision highp float;
+
+uniform sampler2D u_color_texture;
+uniform sampler2D u_normal_texture;
+uniform sampler2D u_metal_roughness_texture;
+uniform sampler2D u_depth_texture;
+uniform sampler2D u_ao_texture;
+
+uniform vec2 u_iRes;
+uniform mat4 u_inverse_viewprojection;
+uniform vec3 u_camera_pos;
+uniform vec2 u_current_total;
+
+//light uniforms
+uniform vec3 u_ambient_light;
+uniform vec3 u_light_position;
+uniform vec3 u_light_color;
+uniform vec3 u_light_direction;
+uniform float u_light_maxdist;
+uniform float u_light_intensity;
+uniform vec3 u_light_vector;	//light vector for directional light
+uniform int u_light_type;
+uniform float u_light_spot_cosine;
+uniform float u_light_spot_inner_cosine;
+uniform float u_light_spot_exponent;
+uniform float u_light_bias;
+uniform bool u_first_pass;
+
+//shadow uniforms
+uniform bool u_is_cascade;
+uniform bool u_bool_shadow;
+uniform sampler2D u_shadow_map;
+
+//irradiance uniforms
+uniform bool u_user_irr;
+uniform sampler2D u_irr_texture;
+uniform vec3 u_irr_start;
+uniform vec3 u_irr_end;
+uniform vec3 u_irr_delta;
+uniform vec3 u_irr_dims;
+uniform float u_irr_factor;
+
+//reflection uniforms
+uniform samplerCube u_environment_texture;
+
+uniform mat4 u_shadow_viewprojection_array[4];	//for cascade in DIRECTIONAL
+uniform mat4 u_shadow_viewprojection;			//for PHONG only so far
+
+layout(location = 0) out vec4 FragColor;
+
+#define RECIPROCAL_PI 0.3183098861837697
+#define PI 3.1415926535897932384626433832795
+
+struct SH9 { float c[9]; }; //to store weights
+struct SH9Color { vec3 c[9]; }; //to store colors
+
+//calculate factors
+float spotDirection( in vec3 world_position );
+float computeAttenuation( in vec3 light_position, in vec3 object_position, in float maxDist );
+float computeShadowFactor( in int type, in vec3 worldpos );
+float calcShadowFactor( in vec3 worldpos );
+
+//IRRADIANCE
+vec3 computeIrradiance( in vec3 indices, in vec3 N );
+vec3 getIrradiance( in vec3 worldpos, in vec3 N );
+vec3 ComputeSHIrradiance(in vec3 normal, in SH9Color sh);
+void SHCosineLobe(in vec3 dir, out SH9 sh); //SH9
+
+//PBR
+float D_GGX ( const in float NoH, const in float linearRoughness );
+vec3 F_Schlick( const in float VoH, const in vec3 f0 );
+float GGX(float NdotV, float k);
+float G_Smith( float NdotV, float NdotL, float roughness);
+vec3 specularBRDF( float roughness, vec3 f0, float NoH, float NoV, float NoL, float LoH );
+
+//GAMMA
+vec3 degamma(vec3 c);
+vec3 gamma(vec3 c);
+
+void main()
+{
+	//calculate uv using the inverse of the resolution
+	vec2 uv = gl_FragCoord.xy * u_iRes.xy;
+
+	//take color value from texture color	
+	vec3 color_texture = texture2D( u_color_texture, uv ).xyz;
+
+	vec3 ambient_light = u_ambient_light;
+	ambient_light = degamma( u_ambient_light );
+
+	//take the normal and the depth from the normal and depth texture
+	//Normal has to be converted to clip space again
+	vec3 N = texture2D( u_normal_texture, uv ).xyz;
+	N = normalize( N * 2.0 - 1.0 );
+	float depth = texture2D( u_depth_texture, uv ).x;
+
+	//reconstruct 3D scene from 2D screen position using the inverse viewprojection of the camera
+	vec4 screen_pos = vec4(uv.x * 2.0 - 1.0, uv.y * 2.0 - 1.0, depth * 2 - 1.0, 1.0);
+	vec4 proj_worldpos = u_inverse_viewprojection * screen_pos;
+	vec3 worldpos = proj_worldpos.xyz / proj_worldpos.w;
+
+	//read metal and roughness values from the metal and roughness texture
+	float metal = texture2D( u_metal_roughness_texture, uv ).z;
+	float roughness = texture2D( u_metal_roughness_texture, uv ).y;
+	float ao_factor = texture2D( u_ao_texture, uv ).x;
+	//float ao_factor = texture2D( u_metal_roughness_texture, uv );
+
+	//calculate f0 reflection based on the color and metalness
+	vec3 f0 = color_texture * metal + (vec3( 0.5 ) * ( 1.0 - metal ));
+
+	SH9Color sh;
+
+	//normalize the Light, Vision and Half vector and compute some dot products
+	vec3 L = normalize( u_light_position - worldpos );
+	vec3 V = normalize( u_camera_pos - worldpos );
+	vec3 H = normalize( L + V );
+	float NdotL = clamp( dot( N, L ), 0.0, 1.0 );
+	float NdotV = clamp( dot( N, V ), 0.0, 1.0 );
+	float NdotH = clamp( dot( N, H ), 0.0, 1.0 );
+	float LdotH = clamp( dot( L, H ), 0.0, 1.0 );
+
+	//calulate the specular and difusse
+	vec3 ks = specularBRDF( roughness, f0, NdotH, NdotV, NdotL, LdotH );
+	vec3 diffuse = ( 1.0 - metal ) * color_texture;	//the most metalness the less diffuse color
+	vec3 kd = diffuse * NdotL;
+	vec3 direct = kd + ks;
+
+	float intensity = u_light_intensity;
+	vec3 light_color = u_light_color;
+	vec3 light = vec3(0.0);
+	float shadowFactor = 1.0;
+	vec3 finalColor = vec3( 0.0 );
+
+	//compute attenuation
+	float att_factor = computeAttenuation( u_light_position, worldpos, u_light_maxdist );
+
+	if(u_light_type == 0)	//directional light
+	{
+		vec3 directionalVector = normalize( u_light_position );
+		direct = ks + diffuse * clamp( dot( N, directionalVector ), 0.0, 1.0 );
+		//shadowFactor = calcShadowFactor(worldpos);
+		shadowFactor = computeShadowFactor( u_light_type, worldpos );
+		light = direct *  intensity * shadowFactor * light_color;
+	}
+	else if(u_light_type == 1)	//point light
+	{
+		light = direct * intensity * light_color * att_factor;
+	}
+	else if(u_light_type == 2)	//spot light
+	{
+		//determine if it's inside light's cone
+		direct *= spotDirection( worldpos );
+		//shadowFactor = calcShadowFactor(worldpos);
+		shadowFactor = computeShadowFactor( u_light_type, worldpos );
+		light = direct * shadowFactor * intensity * light_color * att_factor;
+	}
+
+	if( u_current_total.x == 0 ){
+
+		if( u_user_irr )
+		{
+			//now we can use the coefficients to compute the irradiance
+			vec3 irradiance = getIrradiance( worldpos, N );
+			light += irradiance * u_irr_factor;
+		}
+
+		light += ambient_light;
+	}
+		
+	//light *= ao_factor;
+
+	//finalColor  = light * color_texture;
+
+	if(depth == 1)
+		discard;
+
+	if( u_current_total.x == u_current_total.y)
+	{
+		vec3 R = reflect(V, N);
+		vec3 environment = finalColor * textureLod(u_environment_texture, R, roughness * 5.0).xyz;
+		light = mix( light, environment, metal);
+	}
+	else
+	{
+		light *= 1-metal;
+	}
+
+	finalColor  = light * color_texture * ao_factor;
+	
+	finalColor = gamma( finalColor );
+	FragColor = vec4( finalColor, 1.0 );
+}
+
+vec3 ComputeSHIrradiance(in vec3 normal, in SH9Color sh)
+{
+	// Compute the cosine lobe in SH, oriented about the normal direction
+	SH9 shCosine;
+	SHCosineLobe(normal, shCosine);
+	// Compute the SH dot product to get irradiance
+	vec3 irradiance = vec3(0.0);
+	for(int i = 0; i < 9; ++i)
+		irradiance += sh.c[i] * shCosine.c[i];
+
+	return irradiance;
+}
+
+vec3 getIrradiance( in vec3 worldpos, in vec3 N )
+{
+	//computing nearest probe index based on world position
+	vec3 irr_range = u_irr_end - u_irr_start;
+	vec3 irr_local_pos = clamp( worldpos - u_irr_start 
+	+ N * u_irr_delta * 0.5, //offset a little
+	vec3(0.0), irr_range );
+
+	//convert from world pos to grid pos
+	vec3 irr_norm_pos = irr_local_pos / u_irr_delta;
+
+	//round values as we cannot fetch between rows for now
+	vec3 local_indices = floor( irr_norm_pos );
+
+	//interpolation factors
+	vec3 factors = irr_norm_pos - local_indices;
+
+	vec3 indicesLBF = local_indices;
+	vec3 indicesRBF = local_indices;
+	vec3 indicesLTF = local_indices;
+	vec3 indicesRTF = local_indices;
+	vec3 indicesLBN = local_indices;
+	vec3 indicesRBN = local_indices;
+	vec3 indicesLTN = local_indices;
+	vec3 indicesRTN = local_indices;
+
+	//far face
+	indicesRBF.x += 1;
+	indicesLTF.y += 1;
+	indicesRTF.x += 1;
+	indicesRTF.y += 1;
+
+	//near face
+	indicesLBN.z += 1;
+	indicesRBN.x += 1;
+	indicesRBN.z += 1;
+	indicesLTN.z += 1;
+	indicesLTN.y += 1;
+	indicesRTN.z += 1;
+	indicesRTN.x += 1;
+	indicesRTN.y += 1;
+
+	vec3 irrLBF = computeIrradiance( indicesLBF, N );
+	vec3 irrRBF = computeIrradiance( indicesRBF, N );
+	vec3 irrLTF = computeIrradiance( indicesLTF, N );
+	vec3 irrRTF = computeIrradiance( indicesRTF, N );
+	vec3 irrLBN = computeIrradiance( indicesLBN, N );
+	vec3 irrRBN = computeIrradiance( indicesRBN, N );
+	vec3 irrLTN = computeIrradiance( indicesLTN, N );
+	vec3 irrRTN = computeIrradiance( indicesRTN, N );
+
+	vec3 irrTF = mix( irrLTF, irrRTF, factors.x );
+	vec3 irrBF = mix( irrLBF, irrRBF, factors.x );
+	vec3 irrTN = mix( irrLTN, irrRTN, factors.x );
+	vec3 irrBN = mix( irrLBN, irrRBN, factors.x );
+
+	vec3 irrT = mix( irrTF, irrTN, factors.z );
+	vec3 irrB = mix( irrBF, irrBN, factors.z );
+
+	vec3 irr = mix( irrT, irrB, factors.y );
+	return irr;
+}
+
+vec3 computeIrradiance( in vec3 indices, in vec3 N )
+{
+	//compute in which row is the probe stored
+	float row = indices.x + 
+	indices.y * u_irr_dims.x + 
+	indices.z * u_irr_dims.x * u_irr_dims.y;
+
+	//find the UV.y coord of that row in the probes texture
+	float row_uv = (row + 1.0) / (u_irr_dims.x*u_irr_dims.y*u_irr_dims.z + 1.0);
+	const float d_uvx = 1.0 / 9.0;
+
+	SH9Color sh;
+
+	for(int i = 0; i < 9; ++i)
+	{
+		vec2 coeffs_uv = vec2( (float(i)+0.5) * d_uvx, row_uv );
+		sh.c[i] = texture( u_irr_texture, coeffs_uv).xyz;
+	}
+
+	return ComputeSHIrradiance( N, sh );
+}
+
+void SHCosineLobe(in vec3 dir, out SH9 sh) //SH9
+{
+	const float CosineA0 = PI;
+	const float CosineA1 = (2.0 * PI) / 3.0;
+	const float CosineA2 = PI * 0.25;
+	// Band 0
+	sh.c[0] = 0.282095 * CosineA0;
+	// Band 1
+	sh.c[1] = 0.488603 * dir.y * CosineA1; 
+	sh.c[2] = 0.488603 * dir.z * CosineA1;
+	sh.c[3] = 0.488603 * dir.x * CosineA1;
+	// Band 2
+	sh.c[4] = 1.092548 * dir.x * dir.y * CosineA2;
+	sh.c[5] = 1.092548 * dir.y * dir.z * CosineA2;
+	sh.c[6] = 0.315392 * (3.0 * dir.z * dir.z - 1.0) * CosineA2;
+	sh.c[7] = 1.092548 * dir.x * dir.z * CosineA2;
+	sh.c[8] = 0.546274 * (dir.x * dir.x - dir.y * dir.y) * CosineA2;
+}
+
+//return 1.0 if inside the cone, 0.0 otherwise
+float spotDirection( in vec3 world_position )
+{
+	vec3 L = normalize( u_light_position - world_position );
+	float theta = dot( -L, normalize(u_light_direction) );
+	float epsilon = u_light_spot_inner_cosine - u_light_spot_cosine;
+	float intensity = clamp((theta - u_light_spot_cosine) / epsilon, 0.0, 1.0);
+	if(theta >= u_light_spot_cosine)
+	{
+		return 1.0 * intensity;
+	}	
+	return 0.0;
+}
+
+float computeAttenuation( in vec3 light_position, in vec3 object_position, in float maxDist )
+{
+	float distance = length(object_position - light_position);
+	float att_factor = maxDist - distance;
+	att_factor /= maxDist;
+	att_factor = max(att_factor, 0.0);
+	return att_factor*att_factor;
+}
+
+bool checkShadowmapLevel( in int shadow_index, inout vec3 shadow_uv, inout vec4 shadow_proj_pos, in vec3 worldpos )
+{
+	shadow_proj_pos = u_shadow_viewprojection_array[shadow_index] * vec4(worldpos, 1.0);
+	shadow_uv = shadow_proj_pos.xyz / shadow_proj_pos.w;
+
+	shadow_uv = shadow_uv * 0.5 + vec3(0.5);
+
+	if( shadow_proj_pos.x < 1 && shadow_proj_pos.x > -1 && shadow_proj_pos.y < 1 && shadow_proj_pos.y > -1 )
+		return true;
+	return false;
+}
+
+float computeShadowFactor( in int type, in vec3 worldpos )
+{
+	vec4 shadow_proj_pos;
+	vec3 shadow_uv;
+	bool auxiliar;
+	int level = 0;
+
+	if( type == 0 && u_is_cascade ) //DIRECTIONAL
+	{
+		for( int i = 0; i < 4; i++)
+		{
+			auxiliar = checkShadowmapLevel( i, shadow_uv, shadow_proj_pos, worldpos );
+			if( auxiliar ){
+				level = i;
+				break;
+			}
+		}
+
+		if( !auxiliar )
+			return 1.0;
+
+		switch( level ){
+			case 0:	shadow_uv *= 0.5; break;
+			case 1: shadow_uv.x = shadow_uv.x * 0.5 + 0.5; 
+					shadow_uv.y = shadow_uv.y * 0.5; break;
+			case 2: shadow_uv.x = shadow_uv.x * 0.5;
+					shadow_uv.y = shadow_uv.y * 0.5 + 0.5; break;
+			case 3: shadow_uv = shadow_uv * 0.5 + 0.5; break;
+		}
+	}
+	else	//SPOT
+	{
+		shadow_proj_pos = u_shadow_viewprojection * vec4( worldpos, 1.0 );
+		shadow_uv = shadow_proj_pos.xyz / shadow_proj_pos.w;
+
+		shadow_uv = shadow_uv * 0.5 + vec3(0.5);
+		if( shadow_uv.x < 0 || shadow_uv.x > 1 || shadow_uv.y < 0 || shadow_uv.y > 1 )
+			return 1.0;
+	}
+
+	float real_depth = (shadow_proj_pos.z - u_light_bias) / shadow_proj_pos.w;	//real distance
+	real_depth = real_depth * 0.5 + 0.5;
+	
+	//compare with far and near
+	if( real_depth > 1 || real_depth < 0 )
+		return 1.0;
+
+	float shadow_depth = texture( u_shadow_map, shadow_uv.xy ).x;
+	
+	float xOffset = 1.0 * u_iRes.x;
+	float yOffset = 1.0 * u_iRes.y;
+	float factor = 0.0;
+
+	if (shadow_depth < real_depth)
+		return 0.0;
+	return 1.0;
+}
+
+float calcShadowFactor( in vec3 worldpos )
+{
+	vec4 shadow_proj_pos = u_shadow_viewprojection * vec4( worldpos, 1.0 );
+	vec3 shadow_uv = shadow_proj_pos.xyz / shadow_proj_pos.w;
+	shadow_uv = 0.5 * shadow_uv + 0.5;
+
+	float xOffset = 1.0 * u_iRes.x;
+	float yOffset = 1.0 * u_iRes.y;
+	
+	float factor = 0.0;
+
+	for( int y = -1; y <= 1; y++){
+		for( int x = -1; x <= 1; x++){
+			vec2 offsets = vec2( x * xOffset, y * yOffset );
+			vec3 UVC = vec3(shadow_uv.xy + offsets, shadow_uv.z + 0.00001);
+			factor += texture(u_shadow_map, UVC.xy).x;
+		}
+	}
+	return (0.5 + (factor/18));
+}
+
+float D_GGX ( const in float NoH, const in float linearRoughness )
+{
+	float a2 = linearRoughness * linearRoughness;
+	float f = (NoH * NoH) * (a2 - 1.0) + 1.0;
+	return a2 / (PI * f * f);
+}
+
+vec3 F_Schlick( const in float VoH, const in vec3 f0 )
+{
+	float f = pow(1.0 - VoH, 5.0);
+	return f0 + (vec3(1.0) - f0) * f;
+}
+
+
+float GGX(float NdotV, float k)
+{
+	return NdotV / (NdotV * (1.0 - k) + k);
+}
+	
+float G_Smith( float NdotV, float NdotL, float roughness)
+{
+	float k = pow(roughness + 1.0, 2.0) / 8.0;
+	return GGX(NdotL, k) * GGX(NdotV, k);
+}
+
+vec3 specularBRDF( float roughness, vec3 f0, float NoH, float NoV, float NoL, float LoH )
+{
+	float a = roughness * roughness;
+
+	float D = D_GGX( NoH, a );
+	vec3 F = F_Schlick( LoH, f0 );
+	float G = G_Smith( NoV, NoL, roughness );
+	
+	vec3 spec = D * G * F;
+	spec /= ( 4.0 * NoL * NoV + 1e-6 );
+
+	return spec;
+}
+
+vec3 degamma(vec3 c)
+{
+	return pow(c,vec3(2.2));
+}
+
+vec3 gamma(vec3 c)
+{
+	return pow(c,vec3(1.0/2.2));
+}
+
+float Fd_Burley ( const in float NoV, const in float NoL,
+				const in float LoH, 
+				const in float linearRoughness)
+{
+        float f90 = 0.5 + 2.0 * linearRoughness * LoH * LoH;
+        float lightScatter = F_Schlick( NoL, vec3(1.0) ).x;
+        float viewScatter  = F_Schlick( NoV, vec3(1.0) ).x;
+        return lightScatter * viewScatter * RECIPROCAL_PI;
+}
+
+\ssao.fs
+
+#version 330 core
+
+uniform sampler2D u_depth_texture;
+uniform sampler2D u_normal_texture;
+
+uniform mat4 u_inverse_viewprojection;
+uniform mat4 u_viewprojection;
+uniform vec2 u_iRes;
+uniform vec3 u_points[64];
+
+in vec3 v_normal;
+in vec2 v_uv;
+in vec4 v_color;
+
+layout(location = 0) out vec4 FragColor;
+
+vec3 gamma(vec3 c);
+mat3 cotangent_frame(vec3 N, vec3 p, vec2 uv);
+
+void main()
+{
+	//computations
+	vec2 uv = gl_FragCoord.xy * u_iRes;
+	float depth = texture2D(u_depth_texture, uv).x;
+	if(depth >= 1.0)
+		discard;
+	vec3 N = texture2D( u_normal_texture, uv ).xyz * 2.0 - 1.0;
+	//N = normalize(N * 2.0 - 1.0);
+ 
+	//return if depth is in the background
+	if( depth >= 1.0 )
+	{
+		FragColor = vec4( 0.0 );
+		return;
+	}
+
+	//reprojection to world pos coordinates
+	vec4 screen_position = vec4( uv * 2.0 - 1.0, depth * 2.0 - 1.0, 1.0 );
+	vec4 proj_worldpos = u_inverse_viewprojection * screen_position;
+	vec3 worldpos = proj_worldpos.xyz / proj_worldpos.w;
+
+	//AO 
+	const int SAMPLES = 64;
+	int num = 48;
+	float ao = 0.0;
+
+	mat3 rotmat = cotangent_frame( N, worldpos, uv);
+
+	for( int i = 0; i < SAMPLES; i++ ){
+
+		//compute is world position using the random
+		vec3 p = rotmat * u_points[i];
+		p = worldpos + p * 10.0;
+		//p = rotmat * p;
+
+		//find the uv in the depth buffer of this point
+		vec4 proj = u_viewprojection * vec4( p, 1.0 );
+		proj.xy /= proj.w;	//convert to clipspace from homogeneous
+
+		//apply a tiny bias to its z before converting to clip-space
+		proj.z = (proj.z - 0.005) / proj.w;
+		proj.xyz = proj.xyz * 0.5 + vec3(0.5); //to [0..1]
+
+		//read p true depth
+		float pdepth = texture( u_depth_texture, proj.xy ).x;
+
+		//compare true depth with its depth
+		if( pdepth < proj.z ) //if true depth smaller, is inside
+			num--; //remove this point from the list of visible
+	}
+
+	ao = float(num) / float(SAMPLES);
+
+	FragColor = vec4( ao );
+}
+
+vec3 degamma(vec3 c)
+{
+	return pow(c,vec3(2.2));
+}
+
+vec3 gamma(vec3 c)
+{
+	return pow(c,vec3(1.0/2.2));
+}
+
+mat3 cotangent_frame(vec3 N, vec3 p, vec2 uv)
+{
+	// get edge vectors of the pixel triangle
+	vec3 dp1 = dFdx( p );
+	vec3 dp2 = dFdy( p );
+	vec2 duv1 = dFdx( uv );
+	vec2 duv2 = dFdy( uv );
+	
+	// solve the linear system
+	vec3 dp2perp = cross( dp2, N );
+	vec3 dp1perp = cross( N, dp1 );
+	vec3 T = dp2perp * duv1.x + dp1perp * duv2.x;
+	vec3 B = dp2perp * duv1.y + dp1perp * duv2.y;
+ 
+	// construct a scale-invariant frame 
+	float invmax = inversesqrt( max( dot(T,T), dot(B,B) ) );
+	return mat3( T * invmax, B * invmax, N );
+}
+
+
+\blur.fs
+
+#version 330 core
+
+uniform sampler2D u_texture;
+uniform vec2 u_iRes;
+
+in vec2 v_uv;
+
+layout(location = 0) out vec4 FragColor;
+
+void makeBlur( out vec4 FragColor, in vec2 uv);
+
+void main()
+{
+	vec4 color = vec4(0.0);
+	vec2 uv = v_uv;
+
+	color = texture( u_texture, uv );
+
+	for( int i = -2; i <= 2.0 ; i++)
+	{
+		for(int j = -2; j <= 2.0; j++)
+		{
+			color += texture(u_texture, uv + u_iRes * vec2(i, j) + vec2(0.5) * u_iRes);
+		}
+	}
+
+	color/= 25.0;
+	FragColor = color;
+}
+
+void makeBlur( out vec4 FragColor, in vec2 uv)
+{
+	float Pi = 3.1415926535897932384626433832795;
+
+	float Directions = 16.0;
+	float Quality = 4.0;
+	float size = 8.0;	//blur size
+
+	vec4 color = texture( u_texture, uv );
+
+	vec2 radius = size / u_iRes;
+
+	for( float d = 0.0; d < Pi*2; d += Pi*2/Directions)
+	{
+		for(float i = 1.0/Quality; i <= 1.0; i+=1.0/Quality)
+		{
+			color += texture(u_texture, uv+vec2(cos(d), sin(d)) * radius*i);
+		}
+	}
+
+	color/= Quality * Directions - 15.0;
+
+}
+
+\probe.fs
+
+#version 330 core
+
+uniform mat4 u_viewprojection;
+uniform vec3 u_camera_pos;
+uniform mat4 u_model;
+uniform vec3 u_coeffs[9];
+
+in vec3 v_normal;
+
+const float Pi = 3.141592654;
+const float CosineA0 = Pi;
+const float CosineA1 = (2.0 * Pi) / 3.0;
+const float CosineA2 = Pi * 0.25;
+struct SH9 { float c[9]; }; //to store weights
+struct SH9Color { vec3 c[9]; }; //to store colors
+
+void SHCosineLobe(in vec3 dir, out SH9 sh) //SH9
+{
+	// Band 0
+	sh.c[0] = 0.282095 * CosineA0;
+	// Band 1
+	sh.c[1] = 0.488603 * dir.y * CosineA1; 
+	sh.c[2] = 0.488603 * dir.z * CosineA1;
+	sh.c[3] = 0.488603 * dir.x * CosineA1;
+	// Band 2
+	sh.c[4] = 1.092548 * dir.x * dir.y * CosineA2;
+	sh.c[5] = 1.092548 * dir.y * dir.z * CosineA2;
+	sh.c[6] = 0.315392 * (3.0 * dir.z * dir.z - 1.0) * CosineA2;
+	sh.c[7] = 1.092548 * dir.x * dir.z * CosineA2;
+	sh.c[8] = 0.546274 * (dir.x * dir.x - dir.y * dir.y) * CosineA2;
+}
+
+vec3 ComputeSHIrradiance(in vec3 normal, in SH9Color sh)
+{
+	// Compute the cosine lobe in SH, oriented about the normal direction
+	SH9 shCosine;
+	SHCosineLobe(normal, shCosine);
+	// Compute the SH dot product to get irradiance
+	vec3 irradiance = vec3(0.0);
+	for(int i = 0; i < 9; ++i)
+		irradiance += sh.c[i] * shCosine.c[i];
+
+	return irradiance;
+}
+
+layout( location = 0 ) out vec4 FragColor;
+
+void main()
+{
+	SH9Color coeffsColors;
+	coeffsColors.c = u_coeffs;
+
+	vec3 N = normalize( v_normal );
+	vec3 color = ComputeSHIrradiance( N, coeffsColors );
+	FragColor = vec4( color, 1.0 );
+}
+
+
+\skybox.fs
+
+#version 330 core
+
+precision highp float;
+in vec3 v_world_position;
+
+uniform samplerCube u_texture;
+uniform vec3 u_camera_position;
+
+out vec4 FragColor;
+
+void main()
+{
+	vec3 V = normalize(v_world_position - u_camera_position);
+	FragColor = textureLod( u_texture, -V, 0.0) * 1.0;
+}
+
+\reflection.fs
+
+#version 330 core
+
+uniform samplerCube u_environment_texture;
+uniform samplerCube u_reflection_texture_1;
+uniform samplerCube u_reflection_texture_2;
+uniform vec3 u_probe_1_pos;
+uniform vec3 u_probe_2_pos;
+uniform sampler2D u_normal_texture;
+uniform sampler2D u_metal_roughness_texture;
+uniform sampler2D u_depth_texture;
+uniform sampler2D u_ao_texture;
+uniform vec2 u_iRes;
+uniform mat4 u_inverse_viewprojection;
+uniform vec3 u_camera_pos;
+
+in vec2 v_uv;
+
+layout(location = 0) out vec4 FragColor;
+
+const float MAX_DIST = 250.0f;
+
+void main()
+{
+	//calculate uv using the inverse of the resolution
+	vec2 uv = gl_FragCoord.xy * u_iRes.xy;
+
+	//take the normal and the depth from the normal and depth texture
+	//Normal has to be converted to clip space again
+	vec3 N = texture2D( u_normal_texture, uv ).xyz;
+	N = normalize( N * 2.0 - 1.0 );
+	float depth = texture2D( u_depth_texture, uv ).x;
+
+	if(depth == 1)
+		discard;
+
+	//reconstruct 3D scene from 2D screen position using the inverse viewprojection of the camera
+	vec4 screen_pos = vec4(uv.x * 2.0 - 1.0, uv.y * 2.0 - 1.0, depth * 2 - 1.0, 1.0);
+	vec4 proj_worldpos = u_inverse_viewprojection * screen_pos;
+	vec3 worldpos = proj_worldpos.xyz / proj_worldpos.w;
+
+	float dist_probe_1 = length(u_probe_1_pos - u_camera_pos);
+	float dist_probe_2 = length(u_probe_2_pos - u_camera_pos);
+
+	//read metal and roughness values from the metal and roughness texture
+	float metalness = texture2D( u_metal_roughness_texture, uv ).z;
+	float roughness = texture2D( u_metal_roughness_texture, uv ).y;
+
+	vec3 V = normalize( u_camera_pos - worldpos );
+
+	vec3 R = reflect(V, N);
+
+	vec3 reflection = vec3(0.0);
+
+	if(dist_probe_1 < dist_probe_2 && dist_probe_1 < MAX_DIST)
+	{
+		R.y *= -1.0;
+		reflection = textureLod( u_reflection_texture_1, R, roughness * 5.0 ).xyz;
+	}
+	else if(dist_probe_2 < dist_probe_1 && dist_probe_2 < MAX_DIST)
+	{
+		R.y *= -1.0;
+		reflection = textureLod( u_reflection_texture_2, R, roughness * 5.0 ).xyz;
+	}
+	else
+	{
+		reflection = textureLod( u_environment_texture, R, roughness * 5.0 ).xyz;
+	}
+
+	//compute the reflection
+	//vec3 reflection = textureLod( reflected_texture, R, roughness * 5.0 ).xyz;
+
+	//set the metalness as alpha
+	FragColor = vec4( reflection, metalness );
+
+}
+
+\volumetric.fs
+
+#version 330 core
+
+uniform sampler2D u_depth_texture;
+uniform vec2 u_iRes;
+uniform mat4 u_inverse_viewprojection;
+uniform vec3 u_camera_pos;
+
+uniform sampler2D u_shadow_map;
+uniform vec3 u_light_color;
+uniform float u_light_bias;
+uniform int u_light_type;
+uniform bool u_is_cascade;
+
+uniform mat4 u_shadow_viewprojection_array[4];	//for cascade in DIRECTIONAL
+uniform mat4 u_shadow_viewprojection;			//for PHONG only so far
+
+float computeShadowFactor( in int type, in vec3 worldpos );
+
+layout(location = 0) out vec4 FragColor;
+
+const int SAMPLES = 64;
+
+void main()
+{
+	//calculate uv using the inverse of the resolution
+	vec2 uv = gl_FragCoord.xy * u_iRes.xy;
+
+	float depth = texture2D( u_depth_texture, uv ).x;
+
+	//reconstruct 3D scene from 2D screen position using the inverse viewprojection of the camera
+	vec4 screen_pos = vec4(uv.x * 2.0 - 1.0, uv.y * 2.0 - 1.0, depth * 2 - 1.0, 1.0);
+	vec4 proj_worldpos = u_inverse_viewprojection * screen_pos;
+	vec3 worldpos = proj_worldpos.xyz / proj_worldpos.w;
+
+	vec3 current_position = u_camera_pos;
+	vec3 raydir = worldpos - u_camera_pos;
+	float dist = length(raydir);
+	float step = dist / float(SAMPLES);
+	raydir /= dist;	//normalize raydir
+
+	vec3 offset = raydir * step;
+
+	vec3 color = vec3(0.0);
+	float transparency = 0.0;
+	float air_density = 0.001;
+
+	for( int i = 0; i < SAMPLES; i++)
+	{
+		float shadow_factor = computeShadowFactor( u_light_type, current_position );
+		color += shadow_factor * u_light_color;
+
+		transparency += air_density * step * shadow_factor;
+		if(transparency > 0.15)
+			break;
+
+		current_position += offset;
+	}
+
+	FragColor = vec4( color, transparency );
+
+}
+
+bool checkShadowmapLevel( in int shadow_index, inout vec3 shadow_uv, inout vec4 shadow_proj_pos, in vec3 worldpos )
+{
+	shadow_proj_pos = u_shadow_viewprojection_array[shadow_index] * vec4(worldpos, 1.0);
+	shadow_uv = shadow_proj_pos.xyz / shadow_proj_pos.w;
+
+	shadow_uv = shadow_uv * 0.5 + vec3(0.5);
+
+	if( shadow_proj_pos.x < 1 && shadow_proj_pos.x > -1 && shadow_proj_pos.y < 1 && shadow_proj_pos.y > -1 )
+		return true;
+	return false;
+}
+
+float computeShadowFactor( in int type, in vec3 worldpos )
+{
+	vec4 shadow_proj_pos;
+	vec3 shadow_uv;
+	bool auxiliar;
+	int level = 0;
+
+	if( type == 0 && u_is_cascade ) //DIRECTIONAL
+	{
+		for( int i = 0; i < 4; i++)
+		{
+			auxiliar = checkShadowmapLevel( i, shadow_uv, shadow_proj_pos, worldpos );
+			if( auxiliar ){
+				level = i;
+				break;
+			}
+		}
+
+		if( !auxiliar )
+			return 1.0;
+
+		switch( level ){
+			case 0:	shadow_uv *= 0.5; break;
+			case 1: shadow_uv.x = shadow_uv.x * 0.5 + 0.5; 
+					shadow_uv.y = shadow_uv.y * 0.5; break;
+			case 2: shadow_uv.x = shadow_uv.x * 0.5;
+					shadow_uv.y = shadow_uv.y * 0.5 + 0.5; break;
+			case 3: shadow_uv = shadow_uv * 0.5 + 0.5; break;
+		}
+	}
+	else	//SPOT
+	{
+		shadow_proj_pos = u_shadow_viewprojection * vec4( worldpos, 1.0 );
+		shadow_uv = shadow_proj_pos.xyz / shadow_proj_pos.w;
+
+		shadow_uv = shadow_uv * 0.5 + vec3(0.5);
+		if( shadow_uv.x < 0 || shadow_uv.x > 1 || shadow_uv.y < 0 || shadow_uv.y > 1 )
+			return 1.0;
+	}
+
+	float real_depth = (shadow_proj_pos.z - u_light_bias) / shadow_proj_pos.w;	//real distance
+	real_depth = real_depth * 0.5 + 0.5;
+	
+	//compare with far and near
+	if( real_depth > 1 || real_depth < 0 )
+		return 1.0;
+
+	float shadow_depth = texture( u_shadow_map, shadow_uv.xy ).x;
+	
+	float xOffset = 1.0 * u_iRes.x;
+	float yOffset = 1.0 * u_iRes.y;
+	float factor = 0.0;
+
+	if (shadow_depth < real_depth)
+		return 0.0;
+	return 1.0;
+}
+
+\decal.fs
+
+#version 330 core
+
+in vec4 v_color;
+
+uniform vec4 u_color;
+uniform sampler2D u_texture;
+uniform sampler2D u_depth_texture;
+uniform vec3 u_camera_position;
+
+uniform mat4 u_inverse_viewprojection;
+uniform vec2 u_iRes;
+uniform mat4 u_imodel;
+
+layout(location = 0) out vec4 ColorBuffer;
+
+void main()
+{
+	vec2 uv = gl_FragCoord.xy * u_iRes;
+	float depth = texture( u_depth_texture, uv ).x;
+	if(depth >= 1.0)
+	{
+		discard;
+		return;
+	}
+
+	vec4 screen_position = vec4(uv.x * 2.0 - 1.0, uv.y * 2.0 - 1.0, depth * 2.0 - 1.0, 1.0);
+	vec4 proj_worldpos = u_inverse_viewprojection * screen_position;
+	vec3 worldpos = proj_worldpos.xyz / proj_worldpos.w;
+	vec3 V = normalize(worldpos - u_camera_position);
+
+	vec3 decal_pos = (u_imodel * vec4(worldpos,1.0)).xyz;
+	vec2 uv_decal = decal_pos.xz * 0.5 + vec2(0.5);
+	if( uv_decal.x < 0.0 || uv_decal.x > 1.0 || uv_decal.y < 0.0 || uv_decal.y > 1.0)
+		discard;
+
+	vec4 color = texture( u_texture, uv_decal );
+
+	ColorBuffer = color;
+}
