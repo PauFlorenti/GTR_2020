@@ -24,3 +24,6 @@ Trabajo final de la asignatura GTR de la Universidad Pompeu Fabra. En esta últi
   
 * # DECALS
  Para terminar hemos implementado la opción de poder añadir Decals en nuestro render. Se puede activar y ver uno implementado en la escena.
+![alt text](https://github.com/PauFlorenti/GTR_2020/images/Car.png?raw=true)
+![alt text](https://github.com/PauFlorenti/GTR_2020/images/GBuffers.png?raw=true)
+![alt text](https://github.com/PauFlorenti/GTR_2020/images/Volumetric.png?raw=true)
